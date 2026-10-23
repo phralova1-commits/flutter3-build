@@ -26,45 +26,15 @@ jobs:
         with:
           flutter-version: "3.38.0"
           channel: stable
-          cache: false
-
-      - name: Cache pub packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.pub-cache
-          key: w2a-pub-${{ runner.os }}-${{ hashFiles('**/pubspec.lock') }}
-          restore-keys: w2a-pub-${{ runner.os }}-
-
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches/modules-2
-            ~/.gradle/caches/jars-*
-            ~/.gradle/caches/transforms-*
-            ~/.gradle/wrapper
-          key: w2a-gradle2-${{ runner.os }}-v1
-          restore-keys: w2a-gradle2-${{ runner.os }}-
+          cache: true
 
       - name: Create Project
-        run: |
-          for i in 1 2 3; do
-            rm -rf myapp
-            flutter create --org com.webapk --platforms=android myapp && exit 0
-            echo "flutter create gagal, coba lagi ($i/3)..."
-            sleep 5
-          done
-          exit 1
+        run: flutter create --org com.webapk --platforms=android myapp
 
       - name: Add Dependencies
         working-directory: myapp
         run: |
-          for i in 1 2 3; do
-            flutter pub add webview_flutter && exit 0
-            echo "pub add webview_flutter gagal, coba lagi ($i/3)..."
-            sleep 5
-          done
-          exit 1
+          flutter pub add webview_flutter || flutter pub add webview_flutter || exit 1
 
       - name: Generate main.dart
         run: |
@@ -145,7 +115,7 @@ jobs:
             sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MF"
 
           mkdir -p assets
-          curl -sL --retry 3 --retry-delay 3 --max-time 60 -o /tmp/icon_raw "$ICON_URL" || true
+          curl -sL -o /tmp/icon_raw "$ICON_URL"
           if command -v convert >/dev/null 2>&1; then
             convert /tmp/icon_raw -resize 512x512^ -gravity center -extent 512x512 PNG32:assets/icon.png
           else
@@ -153,7 +123,7 @@ jobs:
           fi
 
           if [ -s assets/icon.png ]; then
-            flutter pub add --dev flutter_launcher_icons || flutter pub add --dev flutter_launcher_icons || true
+            flutter pub add --dev flutter_launcher_icons
             cat >> pubspec.yaml << 'EOF'
 
           flutter_launcher_icons:
@@ -187,13 +157,6 @@ jobs:
           flutter clean
           flutter pub get
           build /tmp/w2.log
-          [ -n "$(found)" ] && exit 0
-
-          echo "=== RETRY 2: bersihkan cache project ==="
-          flutter clean
-          rm -rf android/.gradle android/app/build 2>/dev/null
-          flutter pub get
-          build /tmp/w3.log
           [ -n "$(found)" ] && exit 0
 
           echo "[RESULT_DART_ERROR]"
