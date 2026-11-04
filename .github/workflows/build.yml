@@ -21,6 +21,9 @@ concurrency:
   group: build-${{ github.event.inputs.jobId }}
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -126,7 +129,7 @@ jobs:
         with:
           flutter-version: '3.38.0'
           channel: stable
-          cache: true
+          cache: false
 
       - name: Cache pub packages
         if: steps.detect.outputs.type == 'flutter'
@@ -140,10 +143,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.gradle/caches
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/jars-*
+            ~/.gradle/caches/transforms-*
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('project_raw/**/*.gradle*', 'project_raw/**/gradle-wrapper.properties') }}
-          restore-keys: gradle-${{ runner.os }}-
+          key: gradle2-${{ runner.os }}-${{ hashFiles('project_raw/**/*.gradle*', 'project_raw/**/gradle-wrapper.properties') }}
+          restore-keys: gradle2-${{ runner.os }}-
 
       - name: Ensure yq
         run: |
@@ -379,6 +384,18 @@ jobs:
               continue
             fi
 
+            # better_player (git) butuh path_provider baru yang minta SDK Dart lebih tinggi:
+            # pin path_provider ke 2.1.4 lalu ulangi build (sekali saja)
+            if grep -q "better_player" "$LOG" && grep -qE "path_provider|requires SDK version" "$LOG"; then
+              if [ ! -f /tmp/tried_pp_override ]; then
+                touch /tmp/tried_pp_override
+                echo "🔧 better_player (git) konflik path_provider: pin path_provider ke 2.1.4"
+                yq -i '.dependency_overrides.path_provider = (.dependency_overrides.path_provider // "2.1.4")' pubspec.yaml
+                flutter pub get
+                continue
+              fi
+            fi
+
             P=$(failing_plugin)
             if [ -n "$P" ] && [ "$(yq ".dependencies | has(\"$P\")" pubspec.yaml)" = "true" ]; then
               if [ ! -f "/tmp/tried_up_$P" ]; then
@@ -484,7 +501,7 @@ jobs:
           done
 
           if [ "$(yq '.dependencies | has("better_player")' pubspec.yaml)" = "true" ]; then
-            yq -i '.dependency_overrides.path_provider //= "2.1.4"' pubspec.yaml
+            yq -i '.dependency_overrides.path_provider = (.dependency_overrides.path_provider // "2.1.4")' pubspec.yaml
           fi
 
           if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
@@ -514,9 +531,21 @@ jobs:
         if: steps.detect.outputs.type == 'flutter'
         working-directory: ${{ steps.detect.outputs.dir }}
         run: |
-          rm -f pubspec.lock
+          # Penting: GitHub Actions menjalankan run: dengan "bash -e", jadi tanpa
+          # set +e, kegagalan pertama (mis. OUT=$(flutter pub get)) langsung mematikan
+          # step sebelum fallback jalan dan tanpa menampilkan error apa pun.
+          set +e
+          # Diagnosa: versi Flutter/Dart yang benar-benar terpasang (cek mismatch SDK)
+          flutter --version 2>&1 | head -n 2
+          echo "=== 1. pub get (retry 3x untuk gangguan jaringan) ==="
+          for i in 1 2 3; do
+            flutter pub get && exit 0
+            echo "pub get gagal, coba lagi ($i/3)..."
+            sleep 5
+          done
 
-          echo "=== 1. pub get ==="
+          echo "=== 1b. hapus lock lalu resolve ulang ==="
+          rm -f pubspec.lock
           flutter pub get && exit 0
 
           echo "=== 2. pub upgrade ==="
@@ -527,15 +556,22 @@ jobs:
 
           echo "=== 4. semua versi jadi any ==="
           yq -i '(.dependencies[] | select(tag == "!!str")) = "any"' pubspec.yaml
-          yq -i 'del(.dependency_overrides)' pubspec.yaml
+          # dependency_overrides (path_provider) sengaja TIDAK dihapus: better_player dari git
+          # butuh pin ini, kalau dihapus solver bentrok dengan SDK Dart.
           flutter pub get && exit 0
 
           echo "=== 5. hapus dependency yang gagal satu per satu ==="
           for i in 1 2 3 4 5 6 7 8; do
             OUT=$(flutter pub get 2>&1)
             if [ $? -eq 0 ]; then exit 0; fi
-            BAD=$(echo "$OUT" | grep -oE "(depends on|Because) [a-z0-9_]+" | awk '{print $NF}' \
-                  | grep -vxE "flutter|$(yq '.name' pubspec.yaml)" | head -n 1)
+            # Hapus hanya dependency yang dideklarasikan project sendiri ("Because <app> depends on X"),
+            # bukan dependency transitif yang cuma disebut di pesan (mis. path_provider milik better_player)
+            APP=$(yq '.name' pubspec.yaml)
+            BAD=""
+            for C in $(echo "$OUT" | grep -oE "Because $APP depends on [a-z0-9_]+" | awk '{print $NF}' | sort -u); do
+              case "$C" in flutter|"$APP") continue ;; esac
+              if [ "$(yq ".dependencies | has(\"$C\")" pubspec.yaml)" = "true" ]; then BAD="$C"; break; fi
+            done
             [ -z "$BAD" ] && break
             echo "hapus: $BAD"
             yq -i "del(.dependencies.\"$BAD\")" pubspec.yaml
@@ -580,13 +616,18 @@ jobs:
           fi
 
           echo "Running: $CMD $TASK"
-          $CMD "$TASK" \
-            --parallel --build-cache \
-            -Pandroid.injected.build.abi=arm64-v8a 2>&1 | tee build.log || {
+          for attempt in 1 2; do
+            $CMD "$TASK" \
+              --parallel --build-cache \
+              -Pandroid.injected.build.abi=arm64-v8a 2>&1 | tee build.log && break
+            echo "Build gagal (percobaan $attempt/2)"
+            if [ $attempt -eq 2 ]; then
               echo "::error::Build gagal. Cek log di atas."
               tail -100 build.log
               exit 1
-            }
+            fi
+            sleep 10
+          done
 
       - name: Debug - scan all APK
         if: failure()
@@ -649,6 +690,21 @@ jobs:
           echo "APK_DIR=$APK_DIR" >> "$GITHUB_ENV"
           echo "APK_PATH=$APK" >> "$GITHUB_ENV"
 
+      - name: Upload APK ke release (jalur cepat)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then echo "APK tidak ada, lewati upload release"; exit 0; fi
+          cp "$APK_PATH" "$RUNNER_TEMP/app.apk"
+          for i in 1 2 3; do
+            if gh release upload "${{ github.event.inputs.jobId }}" "$RUNNER_TEMP/app.apk" --clobber --repo "$GITHUB_REPOSITORY"; then
+              echo "APK diupload ke release"; exit 0
+            fi
+            echo "upload release gagal ($i/3)"; sleep 5
+          done
+          exit 0
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -657,6 +713,11 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
+
+      - name: Salin log build
+        if: failure()
+        run: |
+          cp /tmp/b.log "${{ steps.detect.outputs.dir }}/build.log" 2>/dev/null || true
 
       - name: Upload build log
         if: failure()
